@@ -1,0 +1,6 @@
+name = Cicci Handling
+description = Add a line item type for custom handling charges
+core = 7.x
+package = Custom
+dependencies[] = commerce
+dependencies[] = rules

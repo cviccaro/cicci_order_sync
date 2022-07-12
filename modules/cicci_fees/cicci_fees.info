@@ -1,0 +1,6 @@
+name = Cicci Fees
+description = Add a line item type for custom cicci fees
+core = 7.x
+package = Custom
+dependencies[] = commerce
+dependencies[] = rules

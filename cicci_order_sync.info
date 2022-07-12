@@ -1,0 +1,18 @@
+name = Cicci Order Sync
+description = Manages synchronization between order acknowledgement files and orders on the site
+core = 7.x
+package = "JP Enterprises Custom Modules"
+dependencies[] = commerce
+dependencies[] = phpseclibrary
+dependencies[] = cicci_discount
+dependencies[] = cicci_custom_product
+dependencies[] = cicci_custom_payment
+dependencies[] = cicci_handling
+dependencies[] = commerce_addressbook
+dependencies[] = cicci_addressbook
+
+; Information added by Drupal.org packaging script on 2014-07-31
+version = "7.x-1.x-dev"
+datestamp = "1407506029"
+
+configure = admin/config/cicci_order_sync

@@ -1,0 +1,140 @@
+<?php
+/**
+ * Implements hook_commerce_line_item_type_info().
+ * Creates a new line item type.
+ */
+
+
+/**
+ * Implements hook_commerce_line_item_type_info().
+ */
+function cicci_fees_commerce_line_item_type_info() {
+  return array(
+    'cicci_fee' => array(
+      'name' => t('Cicci Fee'),
+      'description' => t('Line item for various Cicci Fees'),
+      'product' => FALSE,
+      'callbacks' => array(
+	      'configuration' => 'cicci_fees_line_item_configuration',
+	      'title' => 'cicci_fees_line_item_title',
+	      'add_form' => 'cicci_fees_line_item_add_form',
+	      'add_form_submit' => 'cicci_fees_line_item_add_form_submit',
+	     ),
+    ),
+  );
+}
+
+function cicci_fees_line_item_configuration($line_item_type) {
+  $type = $line_item_type['type'];
+}
+function cicci_fees_line_item_title($line_item) {
+	return $line_item->line_item_label;
+}
+function cicci_fees_line_item_add_form() {
+	$form = array();
+	return $form;
+}
+function cicci_fees_line_item_add_form_submit() {
+
+}
+
+function cicci_fees_line_item_exists($order, $fee_code, $amount) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $line_items = $order_wrapper->commerce_line_items->value();
+  foreach($line_items as $line_item) {
+    $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+    $unit_price = $line_item_wrapper->commerce_unit_price->value();
+    //if ($line_item->type == 'cicci_fees' && $line_item->data['cicci_fees_fee_code'] == $fee_code && $unit_price['amount'] == $amount) {
+    if ($line_item->type == 'cicci_fees' && $line_item->data['cicci_fees_fee_code'] == $fee_code) {
+      return $line_item;
+    }
+    else if ($fee_code == 'COD' && $line_item->type == 'fee' && $line_item->line_item_label == 'COD Handling Charge') {
+      return $line_item;
+    }
+  }
+  return FALSE;
+}
+
+function cicci_fees_remove_line_item_type(&$order, $fee_code) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $line_items = $order_wrapper->commerce_line_items->value();
+  foreach($line_items as $line_item) {
+    $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+    $unit_price = $line_item_wrapper->commerce_unit_price->value();
+    if ($line_item->type == 'cicci_fees' && $line_item->data['cicci_fees_fee_code'] == $fee_code) {
+      commerce_line_item_delete($line_item->line_item_id);
+    }
+    else if ($fee_code == 'COD' && $line_item->type == 'fee' && $line_item->line_item_label == 'COD Handling Charge') {
+      commerce_line_item_delete($line_item->line_item_id);
+    }
+  }
+}
+
+function cicci_fees_line_item_new($order_id = 0, $title = '', $amount, $fee_code) {
+  $type = 'cicci_fee';
+
+  // Create the new line item.
+  $line_item = entity_create('commerce_line_item', array(
+    'type' => $type,
+    'order_id' => $order_id,
+    'quantity' => 1,
+    'line_item_label' => $title != '' ? $title : _cicci_fees_default_title($fee_code),
+  ));
+
+  $currency_code = 'USD';
+
+  $line_item->commerce_unit_price = array('und' => array(
+    '0' => array('amount' => $amount, 'currency_code' => $currency_code)
+  ));
+
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+  if (!is_null($line_item_wrapper->commerce_unit_price->value())) {
+    // Add the base price to the components array.
+    if (!commerce_price_component_load($line_item_wrapper->commerce_unit_price->value(), 'base_price')) {
+      $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+        $line_item_wrapper->commerce_unit_price->value(),
+        'base_price',
+        $line_item_wrapper->commerce_unit_price->value(),
+        TRUE
+      );
+    }
+  }
+  if (!isset($line_item->data)) {
+    $line_item->data = array();
+  }
+  $line_item->data['cicci_fees_fee_code'] = $fee_code;
+  // Return the line item.
+  return $line_item;
+}
+
+function _cicci_fees_default_title($cost_type) {
+  $title = '';
+  switch($cost_type) {
+          case 'PF':
+            $title = 'Purchase Order Process Fee';
+            break;
+          case 'CAN':         
+            $title = 'Cancellation Charge';
+            break;
+          case 'CHG':
+            $title = 'Order Change Fee Per Item';
+            break;          
+          case 'COD':
+            $title = 'COD Handling Charge';
+            break;          
+          case 'CSC':
+            $title = 'Canada Shipping Service Charge';
+            break;          
+          case 'EXC':
+            $title = 'Exchange Charge';
+            break;          
+          case 'NSF':
+            $title = 'Check Returned Charge';
+            break;          
+          case 'SZD':
+            $title = 'Price for Size Difference';
+            break;          
+  }
+  return $title;
+}

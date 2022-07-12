@@ -1,0 +1,1419 @@
+<?php
+define('CICCI_ORDER_SYNC_ROOT_DIR', DRUPAL_ROOT . '/private/cicci_order_sync');
+define('CICCI_ORDER_SYNC_SFTP_SALT', '9AXdjsFBr58ImmZHdK3g');
+
+module_load_include('inc','comerce_discount', 'commerce_discount.rules');
+
+/**
+ * Implements hook_menu().
+ */
+function cicci_order_sync_menu() {
+	$items['admin/config/cicci_order_sync'] = array(
+		'title' => 'Cicci Order Sync',
+		'description' => 'Configure settings related to cicci_order_sync module',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('cicci_order_sync_admin_form'),
+		'access arguments' => array('administer cicci_order_sync module'),
+		'type' => MENU_NORMAL_ITEM,
+		'file' => 'cicci_order_sync.admin.inc',
+		'file path' => drupal_get_path('module','cicci_order_sync'),
+	);
+	$items['admin/config/cicci_order_sync/config'] = array(
+		'title' => 'Cicci Order Sync Configuration',
+		'description' => 'Configure settings related to cicci_order_sync module',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('cicci_order_sync_admin_form'),
+		'access arguments' => array('administer cicci_order_sync module'),
+		'type' => MENU_DEFAULT_LOCAL_TASK,
+		'file' => 'cicci_order_sync.admin.inc',
+		'file path' => drupal_get_path('module','cicci_order_sync'),
+		'weight' => 0,
+	);
+	$items['admin/config/cicci_order_sync/log'] = array(
+		'title' => 'Cicci Order Sync Log',
+		'description' => 'See logs related to the order sync',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('cicci_order_sync_admin_logs'),
+		'access arguments' => array('administer cicci_order_sync module'),
+		'type' => MENU_LOCAL_TASK,
+		'file' => 'cicci_order_sync.admin.inc',
+		'file path' => drupal_get_path('module','cicci_order_sync'),
+		'weight' => 5,
+	);
+	$items['admin/config/cicci_order_sync/flagged'] = array(
+		'title' => 'Cicci Order Sync - Flagged Items',
+		'description' => 'See flagged orders order_sync processed',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('cicci_order_sync_admin_flags'),
+		'access arguments' => array('administer cicci_order_sync module'),
+		'type' => MENU_LOCAL_TASK,
+		'file' => 'cicci_order_sync.admin.inc',
+		'file path' => drupal_get_path('module','cicci_order_sync'),
+		'weight' => 10,
+	);	
+	return $items;
+}
+
+/**
+ * Implements hook_permission()
+ */
+function cicci_order_sync_permission() {
+	return array(
+		'administer cicci_order_sync module' => array(
+			'title' => t('Administer cicci_order_sync module'),
+			'description' => t('Configure settings related to cicci_order_sync module'),
+			'restrict access' => TRUE,
+		),
+	);
+}
+
+/** 
+ * Implements hook_cron_queue_info().
+ */
+function cicci_order_sync_cron_queue_info() {
+	$queues['sync_order'] = array(
+		'worker callback' => '_cicci_order_sync_sync_order_cron_queue_process',
+		'time' => 60,
+	);
+	return $queues;
+}
+
+
+function _cicci_order_sync_sync_order_cron_queue_process($parsed) {
+	watchdog('cicci_order_sync', 'Starting cron queue process on parsed file: ' . $parsed['file'],NULL,WATCHDOG_INFO);
+	$synced = _cicci_order_sync_sync_order($parsed);
+	if ($synced) {
+		// Move the file to the ack_processed directory
+		rename($parsed['file'], str_replace(CICCI_ORDER_SYNC_ROOT_DIR . '/ack_pending', CICCI_ORDER_SYNC_ROOT_DIR . '/ack_processed',$parsed['file']));
+	}
+	watchdog('cicci_order_sync', 'Ending cron queue process on parsed file: ' . $parsed['file'] . '  Synced Result:' . print_r($synced, TRUE), NULL,WATCHDOG_INFO);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function cicci_order_sync_cron() {
+	//Make sure its past 8 pm and before 8 AM
+	//if (date('H') >= 20 || date('H') <= 8) {
+		$last_run = variable_get('cicci_order_sync_last_run', 0);
+		// every 3 hours
+		if ((time() - $last_run) >= 10800) {
+			watchdog('cicci_order_sync','Starting cicci_order_sync\' cron process.',NULL,WATCHDOG_INFO);
+			// Pull down pending
+			cicci_order_sync_get_remote_files('ack_pending');
+
+			// Check pending
+			_cicci_order_sync_queue_pending();
+			// Check processed and put remotely
+			$processed = _cicci_order_sync_order_acknowledgements('processed');
+			if ($processed) {
+				cicci_order_sync_put_remote_files($processed, 'ack_processed');
+			}
+			// Check errored and put remotely
+			$errored = _cicci_order_sync_order_acknowledgements('errored');
+			if ($errored) {
+				cicci_order_sync_put_remote_files($errored, 'ack_errored');
+			}			
+			watchdog('cicci_order_sync','Finished cicci_order_sync\'s cron process.',NULL,WATCHDOG_INFO);
+		}
+	//}
+}
+
+function _cicci_order_sync_queue_pending() {
+	$pending = _cicci_order_sync_order_acknowledgements('pending');
+	if ($pending) {
+		$queue = DrupalQueue::get('sync_order');
+		foreach($pending as $filename) {
+			$file_path = CICCI_ORDER_SYNC_ROOT_DIR . '/ack_pending/' . $filename;
+			$parsed = _cicci_order_sync_parse_csv($file_path);
+			$queue->createItem($parsed);
+		}
+		variable_set('cicci_order_sync_last_run', time());
+	}
+}
+
+/**
+ * Function that parses order acknowledgement CSV information and returns
+ * all it gathers as associative array
+ */
+function _cicci_order_sync_parse_csv($file_path) {
+	$file_contents = file_get_contents($file_path);
+	if ($file_contents) {
+		$split = explode("\r\n", $file_contents);
+		$info = array(
+			'file' => $file_path,
+		);
+		$x = 0;
+		$gather_lines = FALSE;
+		$gather_cols = array();
+		$gather_key = '';
+		$gather_notes = FALSE;
+		while ($x < count($split)) {
+			$ln = trim($split[$x]);
+			$clean_ln = strtr($ln, array('"' => ''));
+			if ($clean_ln == 'Order Information') {
+
+				// Next line is header columns
+
+				$info['customer'] = array();
+				$cols_line = $split[++$x];
+				$cols = explode(',', $cols_line);
+				$vals_line = $split[++$x];
+				$vals = explode(',', $vals_line);
+				$n = 0;
+				foreach($cols as $col_name) {
+					$clean_col_name = trim(strtr($col_name, array(
+						'"' => ''
+					)));
+					$clean_value = trim(strtr($vals[$n++], array(
+						'"' => ''
+					)));
+					$info['customer'][$clean_col_name] = $clean_value;
+				}
+			}
+			else if ($clean_ln == 'Costume Summary') {
+				$info['products'] = array();
+				// next line is column names
+				// we increase x here in addition to the increase at the end of the
+				// while loop to skip the column header row (this row)
+				$cols_line = $split[++$x]; 
+				$gather_cols = explode(',', $cols_line);
+				$gather_lines = TRUE;
+				$gather_key = 'products';
+			}
+			else if ($gather_lines) {
+				if (!empty($ln)) {
+					// this line is a product
+					$vals = explode('",', $ln);
+					$n = 0;
+					$product = array();
+					foreach($gather_cols as $col_name) {
+						$clean_col_name = trim(strtr($col_name, array(
+							'"' => ''
+						)));
+						$clean_value = trim(strtr($vals[$n++], array(
+							'"' => ''
+						)));
+						if ($clean_col_name == 'Size') {
+							$clean_value = _cicci_order_sync_convert_size($clean_value);
+						}
+						else if ($clean_col_name == 'Style') {
+							$clean_value = _cicci_order_sync_convert_style($clean_value);
+						}
+						$product[$clean_col_name] = $clean_value;
+					}
+					$info[$gather_key][] = $product;
+				}
+				else {
+					$gather_lines = FALSE;
+				}
+			}
+			else if ($clean_ln == 'Addresses') {
+				$info['addresses'] = array();
+				// next line is column names
+				// we increase x here in addition to the increase at the end of the
+				// while loop to skip the column header row (this row)
+				$cols_line = $split[++$x]; 
+				$gather_cols = explode(',', $cols_line);
+				$gather_key = 'addresses';
+				$gather_lines = TRUE;
+			}
+			else if ($clean_ln == 'Summary of Costs') {
+				$info['costs'] = array();
+				$cols_line = $split[++$x];
+				$gather_cols = explode(',', $cols_line);
+				$gather_key = 'costs';
+				$gather_lines = TRUE;
+			}
+			else if ($clean_ln == 'Notes') {
+				$info['notes'] = '';
+				$gather_notes = TRUE;
+			}
+			else if ($gather_notes && !empty($clean_ln)) {
+				$info['notes'] .= $clean_ln . "\r\n";
+			}
+			$x++;
+		}
+
+		return $info;
+	}
+	return FALSE;
+}
+
+function _cicci_order_sync_convert_size($size) {
+	$match = array(
+		'' => 'OS',
+		'XSC' => 'XS',
+		'SMC' => 'SC',
+		'6X7' => '6X7',
+		'MDC' => 'MC',
+		'LGC' => 'LC',
+		'XLC' => 'XLC',
+		'SAD' => 'SA',
+		'MAD' => 'MA',
+		'LAD' => 'LA',
+		'XLA' => 'XLA',
+		'XXL' => 'XXLA',
+		'3XL' => 'XXXLA',
+		'CHLD' => 'CHLD',
+		'ADLT' => 'ADLT'
+	);
+	foreach($match as $csv_size => $site_size) {
+		if ($csv_size == $size) { return $site_size; }
+	}
+	return $size;
+}
+
+function _cicci_order_sync_convert_style($style) {
+	$style_input = $style;
+	$style = trim($style);
+	if (strpos($style, ' ') === FALSE && strpos($style, '-') === FALSE && strlen($style) == 7) {
+		// place dash between 3rd and 4th characters
+		return substr($style, 0, 3) . '-' . substr($style,3,strlen($style));
+	}
+	else if (strpos($style, ' ') !== FALSE && strpos($style, '-') === FALSE) {
+		return str_replace(' ', '-', $style);
+	}
+	return $style;
+}
+
+/**
+ * Return SKU generated from product line (in csv)
+ */
+function _cicci_order_sync_sku_from_product_line($product_line_array) {
+	$style_string = str_replace(' ', '-',$product_line_array['Style']);
+	return sprintf("%s-%s%s",$style_string,$product_line_array['Color'],$product_line_array['Size']);
+}
+
+/**
+ * Wrapper function that gets the SKU from product line and returns the product
+ */
+function _cicci_order_sync_product_from_product_line($product_line_array) {
+	$sku = _cicci_order_sync_sku_from_product_line($product_line_array);
+	return _cicci_order_sync_product_from_sku($sku);
+}
+
+/**
+ * Returns a commerce_product based on a SKU
+ */
+function _cicci_order_sync_product_from_sku($sku) {
+	$query = new EntityFieldQuery();
+	$query->entityCondition('entity_type','commerce_product')->propertyCondition('type','product')->propertyCondition('status',1)->propertyCondition('sku',$sku);
+	$result = $query->execute();
+	if ($result && isset($result['commerce_product'])) {
+		$product_id = key($result['commerce_product']);
+		return commerce_product_load($product_id);
+	}
+	return FALSE;
+}
+
+function _cicci_order_sync_find_existing_order($info) {
+	$customer = $info['customer'];
+	if (isset($customer['Online Order Number']) && !empty($customer['Online Order Number'])) {
+		$sanitized_order_id = trim($customer['Online Order Number']);
+		return commerce_order_load($sanitized_order_id);
+	}
+}
+
+function _cicci_order_sync_find_line_item_on_order($order, $product) {
+	$order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+	$line_items = $order_wrapper->commerce_line_items->value();
+	foreach($line_items as $line_item) {
+		if ($line_item->type == 'product') {
+			$line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+			$line_item_product = $line_item_wrapper->commerce_product->value();
+			if ($line_item_product->sku == $product->sku) {
+				return $line_item;
+			}
+		}
+	}
+	return FALSE;
+}
+
+/**
+ * The Main Function in this module
+ *
+ * This is what is called on cron to process the parsed info from a csv
+ * and alter or add the order within
+ */
+function _cicci_order_sync_sync_order($info) {
+	$user = _cicci_order_sync_find_user_on_order($info);
+
+	
+	$order = _cicci_order_sync_find_existing_order($info);
+	$order_id = $order && isset($order->order_id) ? $order->order_id : NULL;
+	$log = array();
+	$errors = array();
+	$final_message = '';
+	_cicci_order_sync_log_message($info['file'], $order_id, 'start', t('Begin order sync on @file.',array('@file' => $info['file'])), array());
+
+	if ($user) {
+		$user_wrapper = entity_metadata_wrapper('user', $user);
+		$apply_tax = $user_wrapper->field_apply_tax->value();
+		$new = FALSE;
+		if (!$order) {
+			// make new 
+			$new = TRUE;
+			$order = commerce_order_new($user->uid, 'completed', 'commerce_order');
+		}
+		if (!isset($order->data)) {
+			$order->data = array();
+		}
+		// Store a flag so we can tell if this order was done through order_sync in any other module
+		$order->data['cicci_order_sync_invoked'] = TRUE;
+		// Save order with flag before doing anything to it
+		commerce_order_save($order);
+
+		$order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+		$currency_code = 'USD';
+		$skus = array();
+		$tax_rate = commerce_tax_rate_load('pennsylvania_sales_tax');
+		/**************************
+		 *    Process Products    *
+		 **************************/
+		foreach($info['products'] as $product_info) {
+			$sku = _cicci_order_sync_sku_from_product_line($product_info);
+			$product = _cicci_order_sync_product_from_product_line($product_info);
+			if ($product && floatval($product_info['Price']) > 0) {
+				// Working with a legit commerce_product
+				$skus[] = $sku;
+				// Does line item exist on order?
+				$line_item = _cicci_order_sync_find_line_item_on_order($order, $product);
+				if (!$line_item) {
+					// Make new line item if it doesn't exist on order
+					$line_item = commerce_product_line_item_new($product, $product_info['Qty'], $order->order_id);
+					$line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+					$price = $line_item_wrapper->commerce_unit_price->value();
+					$price_fmt = commerce_currency_format($price['amount'], $price['currency_code']);
+					$log['product']['new'][] = array('label' => $line_item->line_item_label, 'sku' => $product->sku, 'id' => $product->product_id, 'time' => time(), 'qty' => $product_info['Qty'], 'price' => $price_fmt);
+					if ($apply_tax) {
+						commerce_tax_rate_apply($tax_rate, $line_item);
+					}
+				//	_cicci_order_sync_alter_price($line_item_wrapper, $product_info['Price'], $log);
+					commerce_line_item_save($line_item);
+					// Add the line item to the order
+					$order_wrapper->commerce_line_items[] = $line_item;
+				}
+				else {
+					// set existing values
+					$line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+					$unit_price = $line_item_wrapper->commerce_unit_price->value();
+					$this_amount = floatval($product_info['Price']) * 100;
+					// if ($line_item_wrapper->commerce_unit_price->amount->value() != $this_amount) {
+					// 	$data = $line_item_wrapper->commerce_unit_price->data->value() + array('components' => array());
+					//     $current_data = $line_item_wrapper->commerce_unit_price->data->value() + array('components' => array());
+					// 	$old_value = $unit_price['amount'];
+					// 	$new_value = $this_amount;
+					// 	$line_item_wrapper->commerce_unit_price->amount = $this_amount;
+					// 	$data['components'] = $current_data['components'];
+         			//	$line_item_wrapper->commerce_unit_price->data = $data;
+					// 	$log['product']['existing'][] = array('label' => $line_item->line_item_label, 'field' => 'unit_price', 'old_value' => $old_value, 'new_value' => $new_value, 'sku' => $product->sku, 'id' => $product->product_id);
+					// }
+					// Set quantity
+					if ($line_item_wrapper->quantity->value() != $product_info['Qty']) {
+						$old_value = $line_item_wrapper->quantity->value();
+						$new_value = $product_info['Qty'];
+						$line_item_wrapper->quantity = $product_info['Qty'];
+						$log['product']['existing_update'][] = array('label' => $line_item->line_item_label, 'field' => 'quantity', 'old_value' => $old_value, 'new_value' => $new_value, 'sku' => $product->sku, 'id' => $product->product_id, 'time' => time());
+					}
+					else {
+						$old_value = $line_item_wrapper->quantity->value();
+						$new_value = $product_info['Qty'];
+						$log['product']['existing_noupdate'][] = array('label' => $line_item->line_item_label, 'field' => 'quantity', 'old_value' => $old_value, 'new_value' => $new_value, 'sku' => $product->sku, 'id' => $product->product_id, 'time' => time());
+				     // Save the updated line item and clear the entity cache.
+					}
+				//	_cicci_order_sync_alter_price($line_item_wrapper, $product_info['Price'], $log);
+					$line_item = commerce_line_item_save($line_item_wrapper->value());
+					entity_get_controller('commerce_line_item')->resetCache(array($line_item_wrapper->line_item_id->value()));
+				}
+				
+			}
+			else {
+				//Make custom
+				$title = $product_info['Name'];
+				$price = floatval($product_info['Price']) * 100;
+
+				$log['product']['custom_start'][] = array(
+					'label' => $title,
+					'sku' => $sku,
+					'id' => $sku,
+					'time' => time(),
+				);
+				$skus[] = $sku;
+				if (!_cicci_custom_product_find_line_item_on_order($order, $sku)) {
+					// Create custom product
+					$custom_product = cicci_custom_product_line_item_new($order_id, $sku, $title, $price, $product_info['Color'], $product_info['Size'], $product_info['Qty']);
+					if ($apply_tax) {
+						commerce_tax_rate_apply($tax_rate, $custom_product);
+					}
+					commerce_line_item_save($custom_product);
+					$order_wrapper->commerce_line_items[] = $custom_product;
+					$price_fmt = commerce_currency_format($price, $currency_code);
+					$log['product']['custom_created'][] = array(
+						'label' => $title,
+						'sku' => $sku,
+						'id' => $sku,
+						'time' => time(),
+						'qty' => $product_info['Qty'],
+						'price' => $price_fmt,
+					);
+				}
+				else {
+					$log['product']['custom_exists'][] = array(
+						'label' => $title,
+						'sku' => $sku,
+						'id' => $sku,
+						'time' => time(),
+					);
+				}
+			}
+		}
+
+		/**********************************************
+		 * Iterate through current line items         *
+		 * to delete products not in acknowledgement, *
+		 * gather discounts, and gather shipping      *
+		 **********************************************/
+		$line_items = $order_wrapper->commerce_line_items->value();
+		$has_discount = FALSE;
+		$current_discounts = array();
+		$current_discount_total = 0;
+		$current_shipping = FALSE;
+		
+		$order_costs = 0;
+		foreach($line_items as $line_item) {
+			$line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+			switch($line_item->type) {
+				case 'product':
+					$line_product = $line_item_wrapper->commerce_product->value();
+					$line_product_wrapper = entity_metadata_wrapper('commerce_product', $line_product);
+					if (!in_array($line_product->sku, $skus)) {
+						$log['product']['deleted'][] = array('label' => $line_item->line_item_label, 'sku' => $line_product->sku, 'id' => $line_product->product_id, 'time' => time());
+						commerce_cart_order_product_line_item_delete($order, $line_item->line_item_id, TRUE);
+					}
+					$order_costs += $line_product_wrapper->commerce_price->amount->value() * $line_item->quantity;
+					break;
+				case 'commerce_discount':
+					$has_discount = TRUE;
+					$discount_unit_price = $line_item_wrapper->commerce_unit_price->value();
+					$current_discounts[] = $discount_unit_price;
+					$current_discount_total += abs($discount_unit_price['amount']);
+					break;
+				case 'cicci_discount':
+					commerce_line_item_delete($line_item->line_item_id);
+					break;
+				case 'cicci_custom_product':
+					if (!in_array($line_item->data['cicci_custom_product_sku'],$skus)) {
+						$log['product']['deleted'][] = array('label' => $line_item->line_item_label, 'sku' => $line_item->data['cicci_custom_product_sku'], 'id' => $line_item->data['cicci_custom_product_sku'], 'time' => time());
+						commerce_line_item_delete($line_item->line_item_id);	
+					}
+					$order_costs += $line_item_wrapper->commerce_total->amount->value();
+					break;
+				case 'shipping':
+					$current_shipping = $line_item;
+					$order_costs += $line_item_wrapper->commerce_unit_price->amount->value();
+				break;
+			}
+		}
+
+		// Gather coupons
+		$current_coupon_total = 0;
+		if (isset($order->commerce_coupon_order_reference) && !empty($order->commerce_coupon_order_reference)) {
+			//Percentage Coupons get applied to the price of items. If there was a change in the quantity of any products the percentage coupon needs to be recalculated
+			//Save the order then reload it to ensure any percentage coupons are recalculated.
+			commerce_order_save($order);
+			$order = commerce_order_load($order->order_id);
+			$order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+			foreach($order->commerce_coupon_order_reference[LANGUAGE_NONE] as $coupon_reference) {
+				$coupon_id = $coupon_reference['target_id'];
+				$coupon = commerce_coupon_load($coupon_id);
+				if ($coupon->type == 'commerce_coupon_pct') {
+					    $coupon_wrapper = entity_metadata_wrapper('commerce_coupon', $coupon);
+
+					    $this_amount = 0;
+					    $components = commerce_price_component_load($order_wrapper->commerce_order_total->value(), $coupon_wrapper->price_component_name->value());
+					    foreach ($components as $component) {
+					      $this_amount += $component['price']['amount'] * -1;
+					    }
+					    $current_coupon_total += abs($this_amount);
+				}
+			}
+		}
+
+		// Add up discounts
+
+		$current_cumulative_discount_amount = $current_discount_total + $current_coupon_total;
+
+
+		/***********************************************************
+		 *   Gather and Process Discounts in Acknowledgements      *
+		 *   Gather Payments in Acknowledgements                   *
+		 *   Gather Shipping in Acknowledgements                   *
+		 **********************************************************/
+		$ack_payment = NULL;
+		$ack_balance = NULL;
+		$ack_shipping = FALSE;
+		$ack_handling = 0;
+		if (isset($info['costs'])) {
+			// Look for discounts or coupons
+			foreach($info['costs'] as $cost) {
+				$cost_type = trim($cost['Fee_Disc_Total']);
+				switch($cost_type) {
+					case 'Discount':
+					case 'Coupon':
+						if (floatval($cost['Total']) != 0) {
+							// Compare this discount to the discounts already on order
+							$discount_amount = floatval($cost['Total']) * 100;
+							if (bccomp($discount_amount, $current_cumulative_discount_amount) !== 0) {
+								$apply_discount_amount = $discount_amount - $current_cumulative_discount_amount;
+								$log['discount'][] = t('Discounts differ.  Current order has discount total of @current, discount in acknowledgement is set to @ackdisc.  Adding a discount of @newdisc to make up the difference.',array('@current' => commerce_currency_format($current_cumulative_discount_amount,$currency_code), '@ackdisc' => commerce_currency_format($discount_amount, $currency_code), '@newdisc' => commerce_currency_format($apply_discount_amount, $currency_code)));	
+								if ($cost['Fee_Disc_Total'] == 'Discount') {
+									$desc = 'Discount: ' . $cost['Description'];
+								  	$discount = cicci_discount_line_item_new($order->order_id, $desc, $apply_discount_amount);
+
+		  							if ($apply_tax) {
+										commerce_tax_rate_apply($tax_rate, $discount);
+									}
+									commerce_line_item_save($discount);
+									$order_wrapper->commerce_line_items[] = $discount;
+									$log['discount'][] = t('Added fixed discount with description @desc of -@price to order', array('@desc' => $desc, '@price' => commerce_currency_format($apply_discount_amount, $currency_code)));
+								}
+								else if ($cost['Fee_Disc_Total'] == 'Coupon') {
+								  	 $desc = 'Coupon: ' . $cost['Description'];
+								  	 $discount = cicci_discount_line_item_new($order->order_id, $desc, $apply_discount_amount);
+					  	 			if ($apply_tax) {
+										commerce_tax_rate_apply($tax_rate, $discount);
+									}
+									  commerce_line_item_save($discount);
+									  $order_wrapper->commerce_line_items[] = $discount;
+									  $log['discount'][] = t('Added coupon discount with description @desc of -@price to order', array('@desc' => $desc, '@price' => commerce_currency_format($discount_amount, $currency_code)));
+								}
+							}
+						}
+					break;
+					case 'Payment':
+						$ack_payment = trim($cost['Total']);
+					break;
+					case 'Balance':
+						$ack_balance = trim($cost['Total']);
+					break;
+					case 'SHP':
+						$ack_shipping = floatval(trim($cost['Total']));
+					break;
+					case 'HAND':
+						if (!cicci_handling_line_item_exists($order)) {
+							// Add handling
+							$ack_handling = floatval(trim($cost['Total']));
+							$ack_handling_amount = $ack_handling * 100;
+							// Add handling as custom line item
+							$cost_desc = trim($cost['Description']);
+							$handling_title = !empty($cost_desc) ? trim($cost_desc) : 'Handling Charges';
+							$handling_product = cicci_handling_line_item_new($order_id, $handling_title, $ack_handling_amount);
+							if ($apply_tax) {
+								commerce_tax_rate_apply($tax_rate, $handling_product);
+							}
+							commerce_line_item_save($handling_product);
+							$order_wrapper->commerce_line_items[] = $handling_product;
+							$log['handling'][] = t('Added handling charge of @charge',array('@charge' => commerce_currency_format($ack_handling_amount, $currency_code)));
+						}
+						break;
+					case 'CSC':
+						$fee_type = commerce_fees_load('ups_freight_collect_fee');
+						$ack_csc_total = floatval(trim($cost['Total']));
+						// Canadian shipping fee
+						$fee_items = array();
+						$add_fee = FALSE;
+						foreach($line_items as $line_item) {
+							if ($line_item->type == 'fee') {
+								$line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+								$unit_price = $line_item_wrapper->commerce_unit_price->value();
+								if (!empty($unit_price['data'])) { 
+									foreach($unit_price['data']['components'] as $fee_component) {
+										if ($fee_component['name'] == 'ups_freight_collect_fee') {
+											$fee_items[] = $line_item;
+										}
+									}
+								}
+							}
+						}
+						$log['fee'][] = t('Acknowledgment contains CSC fee of @total', array('@total' => $ack_csc_total));
+						if (!empty($fee_items)) {
+							$fee_total = 0;
+							foreach($fee_items as $fee_item) {
+								$line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $fee_item);
+								$fee_total += $line_item_wrapper->commerce_total->amount->value() / 100;
+							}
+							$log['fee'][] = t('Order contains CSC fee of @total already.',array('@total' => commerce_currency_format($fee_total * 100, $currency_code)));
+							if ($fee_total != $ack_csc_total) {
+								$log['fee'][] = "They don't match.  Removing fees before adding.";
+  								_cicci_shipping_remove_fees($order, $fee_type);
+  								$add_fee = TRUE;
+							}
+							else {
+								$log['fee'][] = "They match, nothing to do here.";
+							}
+						}
+						else {
+							$add_fee = TRUE;
+							$log['fee'][] = t('Order contains no CSC fee yet.');
+						}
+						if ($add_fee) {
+							$fee_label = !empty($fee_type['display_title']) ? $fee_type['display_title'] : $fee_type['title'];
+							$base_rate = array(
+							  'amount' => commerce_currency_decimal_to_amount($ack_csc_total,$currency_code),
+							  'currency_code' => $currency_code,
+							  'data' => array(),
+							);
+							$base_rate['data'] = commerce_price_component_add($base_rate, $fee_type['name'], $base_rate, TRUE, FALSE);
+							$log['fee'][] = t('Adding fee of @fee to order.',array('@fee' => commerce_currency_format($base_rate['amount'], $base_rate['currency_code'])));
+							$fee_line_item = commerce_fees_line_item_new($fee_type['name'], $base_rate,$order->order_id);
+							$fee_line_item->line_item_label = $fee_label;
+							//$fee_line_item = commerce_fees_add_fee_line_item($fee_line_item, $order);
+							commerce_line_item_save($fee_line_item);
+							$order_wrapper->commerce_line_items[] = $fee_line_item;
+						}
+					break;
+					case 'PF':
+					case 'CAN':					
+					case 'CHG':
+					case 'COD':
+					//case 'CSC':
+					case 'EXC':
+					case 'NSF':
+					case 'SZD':
+						// Purchase Order Fee
+						$fee_amount = floatval(trim($cost['Total'])) * 100;
+						$fee_desc = trim($cost['Description']);
+						$fee_title = !empty($fee_desc) ? $fee_desc : _cicci_fees_default_title($cost_type);
+						$add_fee = FALSE;
+						if ($fee_line_item = cicci_fees_line_item_exists($order, $cost_type, $fee_amount)) {
+							$line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $fee_line_item);
+							$line_item_amount = $line_item_wrapper->commerce_unit_price->amount->value() / 100;
+							$log['fees'][] = t('Order already contains @type fee of cost @cost.',array('@type' => $cost_type, '@cost' => commerce_currency_format($line_item_amount, $currency_code)));
+
+							// Compare fee prices
+							if (bccomp($line_item_amount, $fee_amount) != 0) {
+								cicci_fees_remove_line_item_type($order, $cost_type);
+								$log['fees'][] = t('Order and Acknowledgement @type fees do not match, removing before adding fee again with correct price.',array('@type' => $cost_type));
+								$add_fee = TRUE;
+							}
+						}
+						else {
+							$add_fee = TRUE;
+						}
+						if ($add_fee) {
+							// Fee type doesn't exist.. add it
+							$fee_item = cicci_fees_line_item_new($order_id, $fee_title, $fee_amount, $cost_type);
+							if ($apply_tax) {
+								commerce_tax_rate_apply($tax_rate, $fee_item);
+							}
+							commerce_line_item_save($fee_item);
+							$order_wrapper->commerce_line_items[] = $fee_item;
+							$fee_cost = commerce_currency_format($fee_amount, $currency_code);
+							$log['fees'][] = t('Added fee with code @code and description @desc of cost @cost to order.',array('@cost' => $fee_cost, '@code' => $cost_type, '@desc' => $fee_desc));
+						}
+						break;					
+				}
+			}
+		}
+
+
+		/*********************************************
+		 *    Process General Order/Customer Info    *
+		 *********************************************/
+		if (isset($info['customer']['Ship Date']) && !empty($info['customer']['Ship Date'])) {
+			$time = strtotime($info['customer']['Ship Date']);
+			$formatted_ship_date = date('Y-m-d',$time) . ' 00:00:00';
+			$formatted_tz = date('e',$time);
+			$current_ship_date = isset($order->field_order_ship_date) && !empty($order->field_order_ship_date) ? strtotime($order->field_order_ship_date[LANGUAGE_NONE][0]['value']) : 0;
+			if ($current_ship_date != $time) {
+				$order->field_order_ship_date = array(
+					LANGUAGE_NONE => array(
+						array(
+							'value' => $formatted_ship_date,
+							'timezone' => $formatted_tz,
+							'timezone_db' => $formatted_tz,
+							'date_type' => 'datetime',
+						),
+					),
+				);
+				$log['order']['ship_date'] = t('Changed ship date to @date',array('@date' => $formatted_ship_date));
+			}
+			else {
+				$log['order']['ship_date'] = t('Ship dates match (@date).  No need to update it.',array('@date' => $formatted_ship_date));	
+			}
+
+			if (isset($order->field_select_shipping_date) && empty($order->field_select_shipping_date)) {
+				$order->field_select_shipping_date = array(
+					LANGUAGE_NONE => array(
+						array(
+							'value' => $formatted_ship_date,
+							'timezone' => $formatted_tz,
+							'timezone_db' => $formatted_tz,
+							'date_type' => 'datetime',
+						),
+					),
+				);
+				$log['order']['recital_date'] = t('Recital date was blank on order, so filled it with shipping date (@date)',array('@date' => $formatted_ship_date));
+			}
+
+
+		}
+		if (isset($info['customer']['Order Date']) && !empty($info['customer']['Order Date'])) {
+			$time = strtotime($info['customer']['Order Date']);
+			$order->data['cicci_acknowledgement_order_date'] = $time;
+			if ($order->changed != $time) {
+				$order->changed = $time;
+				$log['order']['order_date'] = t('Changed order date to @date',array('@date' => date('Y-m-d',$time)));
+			}
+			else {
+				$log['order']['order_date'] = t('Order dates match at @date.  No need to update it.',array('@date' => date('Y-m-d',$time)));
+			}
+		}
+		if (isset($info['customer']['Order Number'])) {
+			watchdog('cicci_order_sync',t('Adding Order Number.'),NULL,WATCHDOG_INFO);
+			$order_wrapper->field_cicci_order_number = $info['customer']['Order Number'];
+		}
+		if (isset($info['notes']) && !empty($info['notes'])) {
+			watchdog('cicci_order_sync',t('Adding Notes.'),NULL,WATCHDOG_INFO);
+			//$notes = $order_wrapper->field_notes->value();
+			$notes = '';
+			$order_wrapper->field_notes = $notes . "\r\n" . $info['notes'];
+			$log['order']['notes'] = t('Updated notes.');
+		}
+
+		$csv_addresses = $info['addresses'];
+		$customer = $info['customer'];
+		$profile_types = array('shipping', 'billing');
+		$customer_numbers = array();
+		if (isset($csv_addresses[0]) && isset($csv_addresses[0]['Customer Number']))  {
+			$customer_numbers['billing'] = $csv_addresses[0]['Customer Number'];
+		}
+		else if (isset($customer['Soldto Code'])) {
+			$customer_numbers['billing'] = $customer['Soldto Code'];
+		}
+		if (isset($csv_addresses[1]) && isset($csv_addresses[1]['Customer Number']))  {
+			$customer_numbers['shipping'] = $csv_addresses[1]['Customer Number'];
+		}
+		else if (isset($customer['Shipto Code'])) {
+			$customer_numbers['shipping'] = $customer['Shipto Code'];
+		}
+	
+		// Get Customer Profile
+
+		foreach($profile_types as $profile_type) {
+			$profile_customer_number = $customer_numbers[$profile_type];
+			$address_field_name = 'commerce_customer_' . $profile_type;
+			if ($profile_customer_number == 'DISTTO') {
+				// Special case
+				$notes = $order_wrapper->field_notes->value();
+				$profile_type_idx = $profile_type == 'billing' ? 0 : 1;
+				$a = $csv_addresses[$profile_type_idx];
+				$distto_address = "\r\n\r\nDistribute To:\r\n" . $a['Name'] . "\r\n" . $a['Address 1'];
+				if (!empty($a['Address 2'])) {
+					$distto_address .= "\r\n" . $a['Address 2'];
+				}
+				if (!empty($a['Address 3'])) {
+					$distto_address .= "\r\n" . $a['Address 3'];
+				}
+				$distto_address .= $a['City'] . ', ' . $a['State'] . ' ' . $a['Zip'] ."\r\n" . $a['Country'];
+				if (!empty($a['Phone'])) {
+					$distto_address .= "\r\n" . $a['Phone'];
+				}
+				if (!empty($a['Fax'])) {
+					$distto_address .= "\r\n" . $a['Fax'];
+				}
+				$order_wrapper->field_notes = $notes . "\r\n" . $distto_address;
+				$profile = _cicci_order_sync_find_profile( $user->uid, $profile_type);
+				$distto_log_message = t('Updated notes with Distto Address: @address.',array('@address' => $distto_address));
+				if (isset($log['order']) && isset($log['order']['notes'])) {
+					$log['order']['notes'] = $distto_log_message;
+				}
+				else {
+					$log['order']['notes'] .= $distto_log_message;
+				}
+			}
+			else {
+				$profile = _cicci_order_sync_find_profile( $user->uid, $profile_type);
+			}
+			if (!$profile) {
+				$errors[] = array(
+					'message' => 'No commerce_customer_profile was found that has customer number @number on @file.  Skipping.',
+					'stage' => $address_field_name,
+					'type' => WATCHDOG_NOTICE,
+					'vars' => array('@number' => $customer_numbers[$profile_type])
+				);
+			}
+			else {
+				$order_wrapper->{$address_field_name} = $profile;
+			}
+		}
+		/************************************************
+		 *    Process Shipping collected above          *
+		 ***********************************************/
+				// Ensure there is a shipping cost
+		if ($ack_shipping === FALSE) {
+			$log['shipping'][] = 'Acknowledgement contains no shipping line item.  Setting shipping to $0.00';
+			$ack_shipping = 0;
+		}
+		if ($ack_shipping >= 0) {
+			// Check if order has shipping
+			$ack_shipping_amount = $ack_shipping * 100;
+			$ack_shipping_amount_formatted = commerce_currency_format($ack_shipping_amount, $currency_code);
+			if ($current_shipping === FALSE) {
+				$log['shipping'][] = t('Order contains no shipping items. Acknowledgement contains shipping cost of @cost.',array('@cost' => $ack_shipping_amount_formatted));
+				$log['shipping'][] = t('Adding shipping item with cost of @cost.',array('@cost' => $ack_shipping_amount_formatted));
+				$ack_shipping_cost = array(
+					'amount' => $ack_shipping_amount,
+					'currency_code' => $currency_code,
+				);
+				$shipping_service = commerce_shipping_service_load('custom_flat_rate');
+				$shipping_line_item = commerce_shipping_line_item_new('custom_flat_rate',$ack_shipping_cost,$order->order_id);
+				// Set the price component of the unit price if it hasn't already been done.
+				$shipping_line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $shipping_line_item);
+				$shp_data = $shipping_line_item_wrapper->commerce_unit_price->data->value();
+				if (empty($shp_data['components'])) {
+				    $shipping_line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+				      $ack_shipping_cost,
+				      $shipping_service['price_component'],
+				      $ack_shipping_cost,
+				      TRUE,
+				      FALSE
+				    );
+				 }
+
+				 //$shipping_line_item_wrapper->commerce_unit_price->data->components;
+				 if ($apply_tax) {
+					commerce_tax_rate_apply($tax_rate, $shipping_line_item);
+				}
+				commerce_line_item_save($shipping_line_item);
+				$order_wrapper->commerce_line_items[] = $shipping_line_item;
+			}
+			else {
+				$shipping_line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $current_shipping);
+				$current_shipping_amount = $shipping_line_item_wrapper->commerce_unit_price->amount->value();
+				$log['shipping'][] = t('Order contains a shipping item with cost @ordership. Acknowledgement contains shipping cost of @cost',array('@ordership' => commerce_currency_format($current_shipping_amount, $currency_code), '@cost' => commerce_currency_format($ack_shipping_amount, $currency_code)));
+				if ($current_shipping_amount != $ack_shipping_amount) {
+					$log['shipping'][] = t('Updating current shipping item cost to @cost',array('@cost' => $ack_shipping_amount_formatted));
+					$shipping_service = commerce_shipping_service_load('custom_flat_rate');
+					$shipping_line_item_wrapper->commerce_unit_price->amount = $ack_shipping_amount;
+					// Set the price component of the unit price if it hasn't already been done.
+					$shp_data = $shipping_line_item_wrapper->commerce_unit_price->data->value();
+					// Reset components if needed
+					if (!empty($shp_data['components'])) {
+						$shipping_line_item_wrapper->commerce_unit_price->data  = array();
+					}
+				    $shipping_line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+				      $shipping_line_item_wrapper->commerce_unit_price->value(),
+				      $shipping_service['price_component'],
+				      $shipping_line_item_wrapper->commerce_unit_price->value(),
+				      TRUE,
+				      FALSE
+				    );
+					 if ($apply_tax) {			
+						commerce_tax_rate_apply($tax_rate, $current_shipping);
+					}
+					commerce_line_item_save($current_shipping);
+				}
+				else {
+					$log['shipping'][] = 'They match, no need to update.';
+				}
+			}
+		}
+		else {
+
+		}
+
+
+		/**********************
+		 * Save if no errors *
+		 *********************/
+		if (empty($errors)) {
+			$order->status = 'completed';
+			if (!isset($order->data)) {
+				$order->data = array();
+			}
+			// Store a flag so we can tell if this order was done through order_sync in any other module
+			$order->data['cicci_order_sync_invoked'] = TRUE;
+			
+			// Save the order before processing any payments, so the order will definitely exist.
+			commerce_order_save($order);
+			if ($new) {
+				$final_message = t('Created new order @order_id',array('@order_id' => $order->order_id));
+			}
+			else {
+				$final_message = t('Updated existing order @order_id',array('@order_id' => $order->order_id));
+			}
+
+			/************************************************
+			 *    Process Payment/Balance collected above   *
+			 ***********************************************/
+			$order_payments = commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id));
+			$order_payment_total = 0;
+			if (!empty($order_payments)) {
+				foreach($order_payments as $payment) {
+					if ($payment->status == 'success') { $order_payment_total += floatval($payment->amount); }
+				}
+			}
+			if (!is_null($ack_payment) && !is_null($ack_balance)) {
+				$ack_payment = floatval($ack_payment) * 100;
+				$ack_balance = floatval($ack_balance) * 100;
+				$log['payment']['ack_payment_balance'] = t('Acknowledgement contains payment of @payment with balance of @balance.',array('@payment' => commerce_currency_format($ack_payment, $currency_code), '@balance' => commerce_currency_format($ack_balance, $currency_code)));
+				if ($order_payment_total != 0) {
+					if ($order_payment_total === $ack_payment) {
+						$match = 'They match.  No need to update it.';
+					}
+					else {
+						$order_payment_difference = $ack_payment - $order_payment_total;
+						$match = t('They do not match.  Adding payment of @diff.',array('@diff' => commerce_currency_format($order_payment_difference, $currency_code)));
+					    $payment_method = array(
+					       'instance_id' => 'cicci_custom_payment|cicci_custom_payment',
+					    );
+					    cicci_custom_payment_transaction($payment_method, $order, array('amount' => $order_payment_difference, 'currency_code' => $currency_code));
+					}
+					$log['payment']['current_payment'] = t('Order already contains payment of @payment. @match',array('@payment' => commerce_currency_format($order_payment_total, $currency_code), '@match' => $match));
+				}
+				else {
+					if ($ack_payment > 0) {
+						$order_payment_difference = $ack_payment;
+						$payment_method = array(
+						       'instance_id' => 'cicci_custom_payment|cicci_custom_payment',
+						    );
+					    cicci_custom_payment_transaction($payment_method, $order, array('amount' => $order_payment_difference, 'currency_code' => $currency_code));
+						$log['payment']['current_payment'] = t('Order contains no payment.  Adding custom payment of @diff',array('@diff' => commerce_currency_format($order_payment_difference, $currency_code)));
+					}
+					else {
+						$log['payment']['ack_payment_empty'] = t('Order contains no payment.  Acknowledgement has a payment set to 0.  Skipping payments on this order.');
+					}
+					
+				}
+			}
+
+			if ($new_balance = commerce_payment_order_balance($order)) {
+				if ($new_balance['amount'] != 0) {
+					$order->data['cicci_order_sync_flagged'] = TRUE;
+					commerce_order_save($order);
+				}
+			}
+
+			// Invoke checkout_complete to send emails and take care of other tasks
+			rules_invoke_event('commerce_checkout_complete', $order);
+
+			// // Store a flag so we can tell if this order was done through order_sync in any other module
+			// $order->data['cicci_order_sync_invoked'] = TRUE;
+			// Resave the order with a completed status
+			$order->status = 'completed';
+			commerce_order_save($order);
+		}
+		else {
+			// move file to errors folder
+			$order = FALSE;
+		}
+	}
+	else {
+		$errors[] = array(
+			'message' => 'No user exists on order sync with file @file.  Skipping.',
+			'stage' => 'user',
+			'type' => WATCHDOG_WARNING,
+			'vars' => array(),
+		);
+		$final_message = 'No user exists on order sync with file @file.  Skipping.';
+	}
+	/********************
+	 * Log Messages 	*
+	 ********************/
+	if (!empty($log) && empty($errors)) {
+		// Only log when there are no errors
+		//krsort($log);
+		foreach($log as $log_stage => $log_info) {
+			$log_messages = '';
+			if ($log_stage == 'product') {
+				foreach($log_info as $product_stage => $product_stage_products) {
+					foreach($product_stage_products as $product_log) {
+						switch($product_stage) {
+							case 'new':
+								$log_messages .= t('Added new line item @label (sku @sku, product_id @id) with quantity @qty and price @price',array('@qty' => $product_log['qty'],'@label' => $product_log['label'], '@sku' => $product_log['sku'], '@id' => $product_log['id'], '@price' => $product_log['price']));
+								break;
+							case 'existing_update':
+								$log_messages .= t('Edited @field field on existing line item @label (sku @sku, product_id @id).  Changed value from @old to @new',array('@label' => $product_log['label'], '@sku' => $product_log['sku'], '@id' => $product_log['id'], '@field' => $product_log['field'], '@old' => $product_log['old_value'], '@new' => $product_log['new_value']));
+								break;
+							case 'existing_noupdate':
+								$log_messages .= t('No update on @field field on existing line item @label (sku @sku, product_id @id) and acknowledgement match. (@new_value == @old_value)',array('@label' => $product_log['label'], '@sku' => $product_log['sku'], '@id' => $product_log['id'], '@field' => $product_log['field'], '@old_value' => $product_log['old_value'], '@new_value' => $product_log['new_value']));
+								break;								
+							case 'deleted':
+								$log_messages .= t('Deleted existing line item @label (sku @sku, product_id @id)',array('@label' => $product_log['label'], '@sku' => $product_log['sku'],'@id' => $product_log['id']));
+								break;
+							case 'custom_start':
+								$log_messages .= t('Cannot find product @label (sku @sku) in system, OR, the price was set to 0 in the acknowledgement.  Will need to add custom.  First checking if custom product already exists on order.',array('@label' => $product_log['label'], '@sku' => $product_log['sku']));
+								break;
+							case 'custom_created':
+								$log_messages .= t('Created custom product line item with label @label and sku @sku and quantity @qty and price @price and added to order.',array('@qty' => $product_log['qty'], '@label' => $product_log['label'], '@sku' => $product_log['sku'], '@price' => $product_log['price']));
+								break;
+							case 'custom_exists':
+								$log_messages .= t('Skipping custom product line item @label (sku @sku) because it already exists on order..',array('@label' => $product_log['label'], '@sku' => $product_log['sku']));
+								break;								
+						}
+						$log_messages .= "\r\n";
+					}			
+				}
+			}
+			else {
+				$log_messages = implode("\r\n",$log_info);
+			}
+			$log_time = isset($log_info['time']) ? $log_info['time'] : time();
+			_cicci_order_sync_log_message($info['file'], $order->order_id, $log_stage, $log_messages, array(), $log_time);
+		}
+	}
+	/********************
+	 * 	  Log Errors    *
+	 ********************/
+	if (!empty($errors)) {
+		foreach($errors as $log_info) {
+			// String replacements, taken care of here so order-id can be injected.
+			$message_replacements = $log_info['vars'];
+			$message_replacements['@order_id'] = $order_id;
+			$message_replacements['@file'] = $info['file'];
+			$stage = $log_info['stage'];
+			watchdog('cicci_order_sync',t($log_info['message'],$message_replacements),NULL,$log_info['type']);
+			_cicci_order_sync_log_message($info['file'], $order_id, $stage, $log_info['message'], $message_replacements);
+		}
+		$ack_errors_dir = CICCI_ORDER_SYNC_ROOT_DIR . '/ack_errored';
+		file_prepare_directory($ack_errors_dir, FILE_CREATE_DIRECTORY);
+		rename($info['file'], str_replace(CICCI_ORDER_SYNC_ROOT_DIR . '/ack_pending', $ack_errors_dir, $info['file']));
+	}
+	/***************************
+	 * 	  Log Final Message    *
+	 ***************************/
+	if ($final_message != '') {
+		_cicci_order_sync_log_message($info['file'], $order->order_id, 'complete', $final_message);
+	}
+	return $order;
+}
+
+function _cicci_order_sync_get_log_messages() {
+	return db_select('cicci_order_sync_log','l')->fields('l')->execute()->fetchAllAssoc('log_id');
+}
+
+function _cicci_order_sync_log_replace_tokens($message, $tokens) {
+	foreach($tokens as $search => $replace) {
+		$message = str_replace($search, $replace, $message);
+	}
+	return $message;
+}
+
+function _cicci_order_sync_log_message($filename, $order_id, $stage, $message, $tokens = array(), $log_time = NULL) {
+	static $log_time;
+	if (is_null($log_time)) {
+		$log_time = time();
+	}
+	else {
+		$log_time++;
+	}
+	$tokens['@order_id'] = $order_id;
+	$msg_parsed = t($message, $tokens);
+	if ($order_id == -1) {
+		$order_id = NULL;
+	}
+	$record = array(
+		'filename' => $filename,
+		'order_id' => $order_id,
+		'stage' => $stage,
+		'message' => $msg_parsed,
+		'timestamp' => $log_time,
+	);
+	drupal_write_record('cicci_order_sync_log',$record);
+}
+
+
+// function _cicci_order_sync_alter_price(&$line_item_wrapper, $real_price, &$log = array()) {
+// 	$real_price_amt = floatval($real_price) * 100;
+// 	$current_amt = $line_item_wrapper->commerce_unit_price->amount->value();
+// 	$currency_code = $line_item_wrapper->commerce_unit_price->currency_code->value();
+// 	$product_id = $line_item_wrapper->commerce_product->product_id->value();
+// 	if (bccomp($current_amt, $real_price_amt) !== 0) {
+// 		// Redo this items commerce_unit_price.
+// 		$line_item_wrapper->commerce_unit_price = array('und' => array(
+// 		  '0' => array('amount' => $real_price_amt, 'currency_code' => $currency_code)
+// 		));
+
+// 	    $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+// 	      $line_item_wrapper->commerce_unit_price->value(),
+// 	      'base_price',
+// 	      $line_item_wrapper->commerce_unit_price->value(),
+// 	      TRUE
+// 	    );
+
+// 		$log['product']['existing_update'] = array('label' => $line_item_wrapper->line_item_label->value(), 'field' => 'unit_price', 'old_value' => $current_amt, 'new_value' => $real_price_amt, 'sku' => $product->sku, 'id' => $product_id);
+// 	}
+// }
+
+/**
+ * Find a customer profile based on customer_number field
+ */
+function _cicci_order_sync_find_profile($uid, $type) {
+	$profiles = _cicci_addressbook_get_customer_profiles($uid);
+	if (isset($profiles[$type])) {
+		return $profiles[$type];
+	}
+	$query = new EntityFieldQuery();
+	$query->entityCondition('entity_type','commerce_customer_profile')
+			->propertyCondition('type', $type)
+			->propertyCondition('uid', $uid)
+			//->fieldCondition('field_customer_number','value', $customer_number)
+			->propertyOrderBy('revision_id', 'DESC');
+	$result = $query->execute();
+	if (!empty($result['commerce_customer_profile'])) {
+		$profile_id = key($result['commerce_customer_profile']);
+		return commerce_customer_profile_load($profile_id);
+	}
+	return FALSE;
+}
+
+/**
+ * Find a user who matches the details in the CSV
+ */
+function _cicci_order_sync_find_user_on_order($info) {
+	$customer_number = $info['customer']['Customer Number'];
+	$query = new EntityFieldQuery();
+	$query->entityCondition('entity_type', 'user')->fieldCondition('field_customer_number','value',$customer_number);
+	$result = $query->execute();
+	if ($result && isset($result['user'])) {
+		$key = key($result['user']);
+		$uid = $result['user'][$key]->uid;
+		return user_load($uid);
+	}
+	return FALSE;
+}
+
+/**
+ * Compares addresses in CSV to addresses on user account
+ */
+function _cicci_order_sync_compare_addresses($info, $user) {
+	$csv_addresses = $info['addresses'];
+	include_once DRUPAL_ROOT . '/includes/locale.inc';
+	$countries = country_get_list();
+	$map = array(
+		// CSV => commerce field
+		'Name' => 'name_line',
+		'City' => 'locality',
+		'Address 1' => 'thoroughfare',
+		'Address 2' => 'premise',
+		'Address 3' => 'sub_premise',
+		'State' => 'administrative_area',
+		'Country' => 'country',
+		'Zip' => 'postal_code',
+	);
+	$csv_address_index = array(
+		'billing',
+		'shipping',
+	);
+	$result = array();
+	foreach($csv_address_index as $idx => $type) {
+		$result[$type] = FALSE;
+		$csv_address = $csv_addresses[$idx];
+		$profile_id = commerce_addressbook_get_default_profile_id($user->uid, $type);
+		if ($profile_id) {
+			$profile = commerce_customer_profile_load($profile_id);
+			$profile_wrapper = entity_metadata_wrapper('commerce_customer_profile', $profile);
+			$commerce_address = $profile_wrapper->commerce_customer_address->value();
+			$new_address = array();
+			foreach($map as $csv_key => $commerce_key) {
+				if (strcmp($csv_address[$csv_key], $commerce_address[$commerce_key]) != 0) {
+					$val = $csv_address[$csv_key];
+					if ($csv_key == 'Country') {
+						// make sure country is only 2 letters.
+						if (strlen($val) != 2) {
+							if (strlen($val) == 3) {
+								// truncate to 2..  ex: USA to US
+								$val = substr($val, 0,2);
+							}
+							else if (strlen($val) > 3) {
+								// compare to country list
+								$needle = ucwords(strtolower($val));
+								$search = array_search($needle, $countries);
+								if ($search !== FALSE) {
+									$val = $search;
+								}
+							}
+						}
+					}
+					$new_address[$commerce_key] = $val;
+
+				}
+			}
+			if (!empty($new_address)) {
+				$sanitized_phone = str_replace(' ','',str_replace('(','',str_replace(')','',str_replace('-','', $csv_address['Phone']))));
+				$sanitized_fax = str_replace(' ','',str_replace('(','',str_replace(')','',str_replace('-','', $csv_address['Fax']))));
+				if (strlen($sanitized_phone) != 10) {
+					$sanitized_phone = 1 . $sanitized_phone;
+				}
+				if (strlen($sanitized_fax) != 10) {
+					$sanitized_fax = 1 . $sanitized_fax;
+				}
+				$result[$type] = array(
+					'commerce_customer_address' => $new_address,
+					'field_customer_number' => $info['customer']['Customer Number'],
+					'field_customer_bill_to_code' => $new_address['postal_code'],
+					'field_customer_freight_code' => $new_address['postal_code'],
+					'field_customer_phone' => $sanitized_phone,
+					'field_customer_fax' => $sanitized_fax,
+					'field_customer_contact' => $csv_address['Name'],
+				);				
+			}
+		}
+	}
+	return $result;
+}
+
+/**
+ * Return the order acknowledgement files based on the type (pending, errored, processed)
+ */
+function _cicci_order_sync_order_acknowledgements($type, $show_finished_files = FALSE) {
+	$dir_name = CICCI_ORDER_SYNC_ROOT_DIR . '/ack_' . $type;
+	if ($show_finished_files) {
+		$dir_name = str_replace('cicci_order_sync','cicci_order_sync_finished', $dir_name);
+	}
+	file_prepare_directory($dir_name, FILE_CREATE_DIRECTORY);
+	$dir = new DirectoryIterator($dir_name);
+	$files = array();
+	foreach ($dir as $fileinfo) {
+    	if (!$fileinfo->isDot()) {
+	        $filename = $fileinfo->getFileName();
+	        if (substr($filename, 0, 6) == 'ordack') {
+	        	$files[] = $filename;
+	        }
+	    }
+	}
+	return $files;
+}
+
+/**
+ * An array of the acknowledgement states
+ */
+function _cicci_order_sync_order_acknowledgement_states() {
+	return drupal_map_assoc(array('pending', 'processed', 'errored'));
+}
+
+/**
+ * Gets remote files in a directory via STFP
+ */
+function cicci_order_sync_get_remote_files($directory_name = 'ack_pending') {
+	$sftp = _cicci_order_sync_sftp_setup();
+	if ($sftp) {
+		$sftp->chdir($directory_name);
+		$list = $sftp->nlist();
+		$destination_dir = 'private://cicci_order_sync/' . $directory_name;
+		if ($list) {
+			foreach($list as $file_name) {
+				_cicci_order_sync_get_remote_file($sftp, $file_name, $destination_dir);
+				_cicci_order_sync_delete_remote_file($sftp, $file_name);
+			}
+		}
+	}
+}
+/**
+ * Puts local file to remote in a directory via STFP
+ */
+function cicci_order_sync_put_remote_files($files, $directory_name = 'ack_processed') {
+	if ($files) {
+		$sftp = _cicci_order_sync_sftp_setup();
+		if ($sftp) {
+			$input_dir = 'private://cicci_order_sync/' . $directory_name;
+			foreach($files as $file_name) {
+				$file_path = drupal_realpath($input_dir . '/' . $file_name);
+				$data = file_get_contents($file_path);
+				_cicci_order_sync_put_remote_file($sftp, $data, $file_name);
+
+				// Move file to finished folder					
+				$finished_dir = 'private://cicci_order_sync_finished';
+				file_prepare_directory($finished_dir, FILE_CREATE_DIRECTORY);
+				$finished_subdir = $finished_dir . '/' . $directory_name;
+				file_prepare_directory($finished_subdir, FILE_CREATE_DIRECTORY);
+
+				$new_file_path = str_replace('cicci_order_sync','cicci_order_sync_finished', $file_path);
+				rename($file_path, $new_file_path);
+			}
+		}
+	}
+}
+
+/**
+ * Function to GET SFTP file and save using File API
+ */
+function _cicci_order_sync_get_remote_file(Net_SFTP $sftp, $file_name, $destination_dir = 'private://cicci_order_sync') {
+	if ($data = $sftp->get($file_name)) {
+		file_prepare_directory($destination_dir, FILE_CREATE_DIRECTORY);
+		return file_save_data($data, $destination_dir . '/' . $file_name, FILE_EXISTS_REPLACE);
+	}
+	return FALSE;
+}
+
+/**
+ * Put a file remotely via STFP
+ */
+function _cicci_order_sync_put_remote_file(Net_SFTP $sftp, $data, $destination_path) {
+	if ($data = $sftp->put($destination_path, $data)) {
+		return TRUE;
+	}
+	return FALSE;
+}
+
+/**
+ * Delete a remote file
+ */
+function _cicci_order_sync_delete_remote_file(Net_SFTP $sftp, $file_path) {
+	if ($sftp->delete($file_path)) {
+		return TRUE;
+	}
+	return FALSE;
+}
+
+/**
+ * Loads SFTP configuration and phpseclibrary
+ * and tries to start an SFTP connection
+ */
+function _cicci_order_sync_sftp_setup() {
+	libraries_load('phpseclibrary');
+	$config = array(
+		'server' => variable_get('cicci_order_sync_sftp_server',''),
+		'root' => variable_get('cicci_order_sync_sftp_root',''),
+		'username' => variable_get('cicci_order_sync_sftp_username',''),
+		'password' => variable_get('cicci_order_sync_sftp_password_encoded',''),
+		'private_key' => variable_get('cicci_order_sync_sftp_private_key_fid', ''),
+	);
+	$error = FALSE;
+	foreach($config as $config_key => $value) {
+		if (empty($value)) {
+			$error = TRUE;
+			watchdog('cicci_order_sync', 'No ' . $config_key . ' has been defined for connecting to SFTP server in cicci_order_sync module.  Please configure on module configuration page.', NULL, WATCHDOG_ERROR);
+		}
+	}
+	if (!$error) {
+		// Decode password
+		$decoded = base64_decode($config['password']);
+		// Remove salt
+		$config['password'] = str_replace(CICCI_ORDER_SYNC_SFTP_SALT, '', $decoded);
+		
+		// Load private key
+		$config['private_key'] = file_load($config['private_key']);
+		$sftp_key_contents = file_get_contents(drupal_realpath($config['private_key']->uri));
+
+		// Create Net_SFTP instance
+		$sftp = new Net_SFTP($config['server']);
+		// Create Crypt_RSA instance to place private key in
+		$key = new Crypt_RSA();
+		$key->setPassword($config['password']);
+		$key->loadKey($sftp_key_contents);	
+		if (!$sftp->login($config['username'], $config['password']) && !$sftp->login($config['username'], $key)) {  
+		    watchdog('cicci_order_sync',t('SFTP login failed'),NULL,WATCHDOG_ERROR);
+	        return FALSE;
+		}
+		else {
+			// Goto root dir
+			$sftp->chdir($config['root']);
+			return $sftp;
+		}
+	}
+	return FALSE;
+}

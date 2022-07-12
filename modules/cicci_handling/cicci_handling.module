@@ -1,0 +1,84 @@
+<?php
+/**
+ * Implements hook_commerce_line_item_type_info().
+ * Creates a new line item type.
+ */
+
+
+/**
+ * Implements hook_commerce_line_item_type_info().
+ */
+function cicci_handling_commerce_line_item_type_info() {
+  return array(
+    'cicci_handling' => array(
+      'name' => t('Fixed amount handling charge'),
+      'description' => t('Line item for handling charges'),
+      'product' => FALSE,
+      'callbacks' => array(
+	      'configuration' => 'cicci_handling_line_item_configuration',
+	      'title' => 'cicci_handling_line_item_title',
+	      'add_form' => 'cicci_handling_line_item_add_form',
+	      'add_form_submit' => 'cicci_handling_line_item_add_form_submit',
+	  ),
+    ),
+  );
+}
+
+function cicci_handling_line_item_configuration($line_item_type) {
+  $type = $line_item_type['type'];
+}
+function cicci_handling_line_item_title($line_item) {
+	return $line_item->line_item_label;
+}
+function cicci_handling_line_item_add_form() {
+	$form = array();
+	return $form;
+}
+function cicci_handling_line_item_add_form_submit() {
+
+}
+
+function cicci_handling_line_item_exists($order) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $line_items = $order_wrapper->commerce_line_items->value();
+  foreach($line_items as $line_item) {
+    if ($line_item->type == 'cicci_handling') {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+function cicci_handling_line_item_new($order_id = 0, $title = '', $amount) {
+  $type = 'cicci_handling';
+
+  // Create the new line item.
+  $line_item = entity_create('commerce_line_item', array(
+    'type' => $type,
+    'order_id' => $order_id,
+    'quantity' => 1,
+    'line_item_label' => $title != '' ? $title : 'Handling Charges',
+  ));
+
+  $currency_code = 'USD';
+
+  $line_item->commerce_unit_price = array('und' => array(
+    '0' => array('amount' => $amount, 'currency_code' => $currency_code)
+  ));
+
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+  if (!is_null($line_item_wrapper->commerce_unit_price->value())) {
+    // Add the base price to the components array.
+    if (!commerce_price_component_load($line_item_wrapper->commerce_unit_price->value(), 'base_price')) {
+      $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+        $line_item_wrapper->commerce_unit_price->value(),
+        'base_price',
+        $line_item_wrapper->commerce_unit_price->value(),
+        TRUE
+      );
+    }
+  }
+  // Return the line item.
+  return $line_item;
+}

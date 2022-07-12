@@ -1,0 +1,6 @@
+name = "Cicci Custom Payment"
+description = "Provides a payment method for logging payments done outside the system"
+core = "7.x"
+package = "JP Enterprises Custom Modules"
+dependencies[] = commerce
+dependencies[] = commerce_payment

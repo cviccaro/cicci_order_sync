@@ -1,0 +1,95 @@
+<?php
+/**
+ * Implements hook_commerce_line_item_type_info().
+ * Creates a new line item type.
+ */
+
+
+/**
+ * Implements hook_commerce_line_item_type_info().
+ */
+function cicci_custom_product_commerce_line_item_type_info() {
+  return array(
+    'cicci_custom_product' => array(
+      'name' => t('Custom Product'),
+      'description' => t('Line item for custom products'),
+      'product' => FALSE,
+      'callbacks' => array(
+        'configuration' => 'cicci_custom_product_line_item_configuration',
+        'title' => 'cicci_custom_product_line_item_title',
+        'add_form' => 'cicci_custom_product_line_item_add_form',
+        'add_form_submit' => 'cicci_custom_product_line_item_add_form_submit',
+      ),
+    ),
+  );
+}
+
+
+function cicci_custom_product_line_item_configuration($line_item_type) {
+  $type = $line_item_type['type'];
+}
+function cicci_custom_product_line_item_title($line_item) {
+  return $line_item->line_item_label;
+}
+function cicci_custom_product_line_item_add_form() {
+  $form = array();
+  return $form;
+}
+function cicci_custom_product_line_item_add_form_submit() {
+
+}
+
+
+
+function cicci_custom_product_line_item_new($order_id = 0, $sku, $title = '', $amount, $color, $size, $qty) {
+  $type = 'cicci_custom_product';
+
+  // Create the new line item.
+  $line_item = entity_create('commerce_line_item', array(
+    'type' => $type,
+    'order_id' => $order_id,
+    'quantity' => $qty,
+    'line_item_label' => $title,
+    'data' => array(
+      'cicci_custom_product_sku' => $sku,
+      'cicci_custom_product_color' => $color,
+      'cicci_custom_product_size' => $size,
+    ),
+  ));
+
+  $currency_code = 'USD';
+
+  $line_item->commerce_unit_price = array('und' => array(
+    '0' => array('amount' => $amount, 'currency_code' => $currency_code)
+  ));
+
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+  if (!is_null($line_item_wrapper->commerce_unit_price->value())) {
+    // Add the base price to the components array.
+    if (!commerce_price_component_load($line_item_wrapper->commerce_unit_price->value(), 'base_price')) {
+      $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+        $line_item_wrapper->commerce_unit_price->value(),
+        'base_price',
+        $line_item_wrapper->commerce_unit_price->value(),
+        TRUE
+      );
+    }
+  }
+  //commerce_tax_rate_rules_apply($line_item, 'pennsylvania_sales_tax');
+  // Return the line item.
+  return $line_item;
+}
+
+function _cicci_custom_product_find_line_item_on_order($order, $sku) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $line_items = $order_wrapper->commerce_line_items->value();
+  foreach($line_items as $line_item) {
+    if ($line_item->type == 'cicci_custom_product' && isset($line_item->data) && isset($line_item->data['cicci_custom_product_sku'])) {
+      if ($sku == $line_item->data['cicci_custom_product_sku']) {
+        return $line_item;
+      }
+    }
+  }
+  return FALSE;
+}

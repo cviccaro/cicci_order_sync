@@ -1,0 +1,6 @@
+name = Cicci Custom Product
+description = Add a line item type for custom products
+core = 7.x
+package = Custom
+dependencies[] = commerce
+dependencies[] = rules

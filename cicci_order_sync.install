@@ -1,0 +1,50 @@
+<?php
+
+function cicci_order_sync_schema() {
+	$schema = array();
+	$schema['cicci_order_sync_log'] = array(
+		'description' => 'Logs Events during Cicci Order Sync',
+		'fields' => array(
+		      'log_id' => array(
+		        'description' => 'The primary identifier for a log.',
+		        'type' => 'serial',
+		        'unsigned' => TRUE,
+		        'not null' => TRUE,
+		      ),
+			'filename' => array(
+				'type' => 'varchar',
+				'length' => 255,
+				'not null' => TRUE,
+				'default' => '',
+			),
+			'order_id' => array(
+				'type' => 'int',
+				'length' => 32,
+		        'unsigned' => TRUE,
+    			'not null' => FALSE,
+        		'default' => NULL,
+			),
+			'stage' => array(
+				'type' => 'varchar',
+				'length' => 255,
+				'not null' => TRUE,
+				'default' => '',
+			),
+			'message' => array(
+		        'description' => 'The logged message',
+		        'type' => 'text',
+		        'not null' => TRUE,
+		        'size' => 'medium',
+		        'translatable' => TRUE,
+			),
+			'timestamp' => array(
+			  'description' => 'The Unix timestamp when the event occured',
+			  'type' => 'int',
+			  'not null' => TRUE,
+			  'default' => 0,
+			),
+		),
+    	'primary key' => array('log_id'),
+	);
+	return $schema;
+}

@@ -1,0 +1,6 @@
+name = Cicci Discount
+description = Add a line item type for custom discounts
+core = 7.x
+package = Custom
+dependencies[] = commerce
+dependencies[] = rules
